@@ -1,6 +1,6 @@
-//step31 completed
 /*** includes ***/
 #include <unistd.h>
+#include <string.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -9,10 +9,28 @@
 #include <sys/ioctl.h>
 
 /*** defines ***/
+#define KILO_VERSION "0.0.1"
+
 #define CTRL_KEY(k) ((k) & 0x1f)
+
+enum editorKey {
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP ,
+    ARROW_DOWN,
+    DEL_KEY,
+    HOME_KEY,
+    END_KEY,
+    PAGE_UP,
+    PAGE_DOWN
+};
 
 /*** data ***/
 struct editorConfig {
+    //cursor controls
+    int cx, cy;
+
+    //other variables
     int screenrows;
     int screencols;
     struct termios orig_termios;
@@ -48,37 +66,82 @@ void enableRawMode() {
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 
-char editorReadKey() {
+int editorReadKey() {
     int nread;
     char c;
     while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
         if (nread == -1 && errno != EAGAIN) die("read");
     }
-    return c;
+    
+    if (c == '\x1b') {
+        char seq[3];
+
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+
+        
+        if (seq[0] == '[') {
+            if (seq[1] >= '0' && seq [1] <= '9') {
+                if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+                if (seq[2] == '~'){
+                    //mapping PAGEUP and PAGEDOWN keys
+                    /* let’s implement Home & End keys. Unlike the previous keys, there are many different escape sequences that could be sent by these keys, depending on your OS, or your terminal emulator. The Home key could be sent as <esc>[1~, <esc>[7~, <esc>[H, or <esc>OH. Similarly, the End key could be sent as <esc>[4~, <esc>[8~, <esc>[F, or <esc>OF.*/
+                    switch (seq[1]) {
+                        case '1' : return HOME_KEY;
+                        case '3' : return DEL_KEY;
+                        case '4' : return END_KEY;
+                        case '5' : return PAGE_UP;
+                        case '6' : return PAGE_DOWN;
+                        case '7' : return HOME_KEY;
+                        case '8' : return END_KEY;
+                    }
+                }
+            } else {
+                //mapping the arrow keys to their definitions for moving cursor
+                switch (seq[1]) {
+                    case 'A' : return ARROW_UP;
+                    case 'B' : return ARROW_DOWN;
+                    case 'C' : return ARROW_RIGHT;
+                    case 'D' : return ARROW_LEFT;
+                    case 'H' : return HOME_KEY;
+                    case 'F' : return END_KEY;
+                }
+            }
+        } else if (seq[0] == 'O') {
+            switch (seq[1]){
+                case 'H' : return HOME_KEY;
+                case 'F' : return END_KEY;
+            }
+        }
+        return '\x1b';
+    } else {
+        return c;
+    }
 }
 
 int getCursorPosition(int *rows, int *cols) {
+    char buf[32];
+    unsigned int i = 0;
+
     if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4) return -1;
 
-    printf("\r\n");
-    char c;
-    while(read(STDIN_FILENO, &c, 1) == 1) {
-        if (iscntrl(c)){
-            printf("%d\r\n", &c);
-        }
-        else{
-            printf("%d ('%c')\r\n", c, c);
-        }
+    while (i < sizeof(buf) - 1){
+        if (read(STDIN_FILENO, &buf[i], 1) != 1) break;
+        if ((buf[i] = 'R')) break;
+        i++;
     }
+    buf[i] = '\0';
 
-    editorReadKey();
-    return -1;
+    if (buf[0] != '\x1b' || buf[1] != '[') return -1;
+    if (sscanf(&buf[2], "%d;%d", rows, cols) != 2) return -1;
+
+    return 0;
 }
 
 int getWindowSize(int *rows, int *cols) {
     struct winsize ws;
 
-    if(1 || ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+    if(ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
         if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1;
         return getCursorPosition(rows, cols);
     }
@@ -89,25 +152,131 @@ int getWindowSize(int *rows, int *cols) {
     }
 }
 
+/*** append buffer ***/
+
+//we use this to minimise making small write commands, basically instead of updating screen in small increments
+//we could create a buffer to create a sort of queue for changes that we want to make
+struct abuf {
+    char *b;
+    int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf *ab, const char *s, int len) {
+    //we ask realloc to allocate memory that is enough for our current
+    //string and the string we are going to append
+    char *new = realloc(ab->b, ab->len + len);
+
+    if (new == NULL) return;
+    /*then we use memcpy to copy the string s after the end of current
+    data buffer, as the format of memcpy call is - dest, source, size*/
+    memcpy(&new[ab->len], s, len);
+    //updating the values. both the string and the length values
+    ab->b = new;
+    ab->len += len;
+}
+
+//using a simple destructor to deallocate the dynamic memory used
+void abFree(struct abuf *ab) {
+    free(ab->b);
+}
+
 /*** output ***/
-void editorDrawRows() {
+void editorDrawRows(struct abuf *ab) {
     int y;
     for (y = 0; y < E.screenrows; y++){
-        write(STDOUT_FILENO, "~\r\n", 3);
+        if (y == E.screenrows / 3) {
+            // welcome message
+            char welcome[80];
+            int welcomelen = snprintf(welcome, sizeof(welcome), "Kilo editor -- version %s", KILO_VERSION);
+
+            //if terminal is too small, we truncate the length
+            if (welcomelen > E.screencols) welcomelen = E.screencols;
+            
+            //centering our welcome message
+            int padding = (E.screencols - welcomelen) / 2;
+            if (padding) {
+                abAppend(ab, "~", 1);
+                padding--;
+            }
+            while (padding--) abAppend(ab, " ", 1);
+            abAppend(ab, welcome, welcomelen);
+        } else {
+            abAppend(ab, "~", 1);
+        }
+
+        /* the \x1b[K erases part of the current line which is on the 
+        right of the cursor */
+        abAppend(ab, "\x1b[K", 3);
+        if(y < E.screenrows - 1) {
+            abAppend(ab, "\r\n", 2);
+        }
     }
 }
 
 void editorRefreshScreen() {
-    write(STDOUT_FILENO, "\x1b[2J", 4);
-    write(STDOUT_FILENO, "\x1b[H", 3);
+    struct abuf ab = ABUF_INIT;
 
-    editorDrawRows();
-    write(STDOUT_FILENO, "\x1b[H", 3);
+    //the immediately below statement hides the cursor while
+    //screen is being drawn
+    abAppend(&ab, "\x1b[?25l", 6);
+    //below statement ommitted to allow clearing of one line at a time
+    // abAppend(&ab, "\x1b[2J", 4);
+    abAppend(&ab, "\x1b[H", 3);
+
+    editorDrawRows(&ab);
+
+    /* the below part is to move the cursor to the starting position.
+    We add 1 to E.cy and E.cx to convert from 0-indexed values to the 1-indexed values that the terminal uses. */
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    abAppend(&ab, buf, strlen(buf));
+
+    //re-show the cursor
+    abAppend(&ab, "\x1b[?25h", 6);
+
+    /*we compiled all the changes into a buffer struct,
+    now when we are done with populating the buffer, we execute
+    a write statement to publish the changes.*/
+    write(STDOUT_FILENO, ab.b, ab.len);
+
+    //after we are done writing, we free the memory used by the buffer
+    abFree(&ab);
 }
 
 /*** input ***/
-void editorProcessKey() {
-    char c = editorReadKey();
+
+void editorMoveCursor(int key) {
+    /* here we create a simple switch statement to manipulate the 
+    co-ordinates of the editor using the wasd keys */
+    switch (key)
+    {
+    case ARROW_LEFT:
+        if (E.cx != 0){
+            E.cx--;
+        }
+        break;
+    case ARROW_RIGHT:
+        if (E.cx != E.screencols - 1) {
+            E.cx++;
+        }
+        break;
+    case ARROW_UP:
+        if ( E.cy != 0) {
+            E.cy--;
+        }
+        break;
+    case ARROW_DOWN:
+        if ( E.cy != E.screenrows - 1) {
+            E.cy++;
+        } 
+        break;
+    }
+}
+
+void editorProcessKeypress() {
+    int c = editorReadKey();
 
     switch (c)
     {
@@ -116,12 +285,42 @@ void editorProcessKey() {
         write(STDOUT_FILENO, "\x1b[H", 3);
         exit(0);
         break;
+
+    //mapping home and end keys to move one bye to the left or right
+    case HOME_KEY:
+        E.cx = 0;
+        break;
+
+    case END_KEY:
+        E.cx = E.screencols - 1;
+        break;
+
+    /* making PAGEUP and PAGEDOWN keys a sort of scroll wheel */
+    case PAGE_UP:
+    case PAGE_DOWN:{
+        int times = E.screenrows;
+        while (times--){
+            editorMoveCursor( c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+        }
+        break;
+    }
+
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+        editorMoveCursor(c);
+        break;
     }
 }
 
 /*** init ***/
 
 void initEditor() {
+    //cursor control co-ordinates
+    E.cx = 0;
+    E.cy = 0;
+    
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die ("getWindowSize");
 }
 
@@ -132,7 +331,7 @@ int main(){
 
     while (1){
         editorRefreshScreen();
-        editorProcessKey();
+        editorProcessKeypress();
     }
 
     return 0;
